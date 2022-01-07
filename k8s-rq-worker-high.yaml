@@ -17,8 +17,8 @@ spec:
     spec:
       containers:
         - name: rq-worker
-          image: sekai-redis-monitor:latest
-          imagePullPolicy: Never
+          image: oreandawe/redis-queue-monitor-worker:latest
+          imagePullPolicy: IfNotPresent
           command:
             - rq
             - worker
@@ -26,7 +26,7 @@ spec:
             - -w
             - app.MyWorker  # see app/__init__.py for class definition
             - --url
-            - redis://redis-server:6379
+            - redis://redis-server:36379
           env: []
           envFrom: []
           volumeMounts: []
