@@ -8,5 +8,4 @@ ENV FLASK_APP=server FLASK_ENV=development PATH="/home/runner/.local/bin:$PATH" 
 RUN python -m pip install --user --upgrade pip
 ADD requirements.txt ./
 RUN pip install --user -r requirements.txt
-ADD gunicorn_config.py ./
 ADD /app ./app
