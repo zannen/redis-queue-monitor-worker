@@ -2,16 +2,22 @@
 Provide a Flask app
 """
 
+import collections
 import datetime
 import logging
 import os
 import time
+from typing import List
 
 import flask
 import redis
 import rq
 import rq.worker
 import yaml
+
+# for `API` and `API_VER`, see the APIService definition.
+API = "custom.metrics.k8s.io"
+API_VER = "v1beta1"
 
 
 def queue_func(*args, **kwargs):
@@ -62,6 +68,22 @@ def base_app(config: dict):
     return app
 
 
+def queue_job_count(
+    redis_conn,
+    queue_name: str,
+    job_statuses: List[str],
+) -> int:
+    queue = rq.Queue(queue_name, connection=redis_conn)
+    count = 0
+    for job_id in queue.job_ids:
+        job = queue.fetch_job(job_id)
+        if job is None:
+            continue
+        if job.get_status(refresh=True) in job_statuses:
+            count += 1
+    return count
+
+
 def create_apiserver_app(config={}):
     """
     This function is called by gunicorn and creates a Flask app.
@@ -76,12 +98,42 @@ def create_apiserver_app(config={}):
     def path_queues_list():
         return {"queues": sorted(app.redis_queue_names)}, 200
 
+    @app.route("/queues/<queue_name>/jobs")
+    def path_queue_jobs(queue_name):
+        if queue_name not in app.redis_queue_names:
+            return {"error": "queue not found"}, 404
+        queue = rq.Queue(queue_name, connection=app.redis_conn)
+        jobs = {}
+        for job_id in queue.job_ids:
+            job = queue.fetch_job(job_id)
+            if job is None:
+                jobs[job_id] = {"error": "job not found"}
+            else:
+                jobs[job_id] = {
+                    "id": job.id,
+                    "result": job.result,
+                    "status": job.get_status(),
+                }
+        return {"jobs": jobs}, 200
+
     @app.route("/queues/<queue_name>/length")
     def path_queue_length(queue_name):
         if queue_name not in app.redis_queue_names:
             return {"error": "queue not found"}, 404
         queue = rq.Queue(queue_name, connection=app.redis_conn)
         return {"length": len(queue)}, 200
+
+    @app.route("/queues/<queue_name>/counts")
+    def path_queue_counts(queue_name):
+        queue = rq.Queue(queue_name, connection=app.redis_conn)
+        counts = collections.defaultdict(lambda: 0)
+        for job_id in queue.job_ids:
+            job = queue.fetch_job(job_id)
+            if job is None:
+                continue
+            status = job.get_status(refresh=True)
+            counts[status] += 1
+        return {"counts": counts}, 200
 
     @app.route("/queues/<queue_name>/enqueue", methods=["POST"])
     def path_queues_enqueue(queue_name):
@@ -131,49 +183,77 @@ def create_metrics_exporter_app(config={}):
     """
     app = base_app(config)
 
-    api = "custom.metrics.k8s.io"
-    apiVer = "v1beta1"
-    path_base = f"/apis/{api}/{apiVer}"
-
-    @app.route(f"{path_base}/")
-    def path_root():
-        return {"status": "healthy"}, 200
-
-    @app.route(
-        f"{path_base}/namespaces/<namespace>/deployments.apps/<deployment_app>"
+    base_path = f"/apis/{API}/{API_VER}"
+    metric_path = (
+        f"{base_path}/namespaces/<namespace>/deployments.apps/<deployment_app>"
         "/<metric>"
     )
-    def path_deploymentsapps_metric(namespace, deployment_app, metric):
+
+    def redisqueue_length(namespace, deployment_app, metric):
+        # For `metricLabelSelector`, see `matchLabels` in rq-worker-*.yaml.
         mls = flask.request.args.get("metricLabelSelector")
-        # see matchLabels in rq-worker-*.yaml.
-        queue_length = 0
-        queue_name = "?"
-        if mls.startswith("queue="):
-            queue_name = mls[6:]
-            if queue_name in app.redis_queue_names:
-                queue = rq.Queue(queue_name, connection=app.redis_conn)
-                queue_length = len(queue)
+        qlengths = 0
+        qnames = "?"
+        if mls.startswith("queues="):
+            qnames = mls[7:]
+            for qname in qnames.split("-"):
+                if qname in app.redis_queue_names:
+                    qlengths += queue_job_count(
+                        app.redis_conn,
+                        qname,
+                        ["queued", "started"],
+                    )
 
         now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         content = {
             "kind": "MetricValueList",
-            "apiVersion": f"{api}/{apiVer}",
-            "metadata": {"selflink": f"{path_base}/"},
+            "apiVersion": f"{API}/{API_VER}",
+            "metadata": {"selflink": f"{base_path}/"},
             "items": [
                 {
                     "describedObject": {
-                        "kind": "Service",
+                        "kind": "Deployment",
                         "namespace": namespace,
-                        "name": f"rq-worker-{queue_name}",
-                        "apiVersion": f"/{apiVer}",
+                        "name": deployment_app,
+                        "apiVersion": "apps/v1",
                     },
                     "metricName": "count",
                     "timestamp": now,
-                    "value": str(queue_length),
+                    "value": str(qlengths),
                 },
             ],
         }
         return content, 200
+
+    metrics = {
+        "redisqueue_length": redisqueue_length,
+    }
+
+    @app.route(f"{base_path}")
+    @app.route(f"{base_path}/")
+    def path_root():
+        return {
+            "kind": "APIResourceList",
+            "apiVersion": "v1",
+            "groupVersion": f"{API}/{API_VER}",
+            "resources": [
+                {
+                    "name": f"deployments.apps/{metric_name}",
+                    "singularName": "",
+                    "namespaced": True,
+                    "kind": "MetricValueList",
+                    "verbs": ["get"],
+                } for metric_name in sorted(metrics.keys())
+            ]
+        }, 200
+
+    @app.route(metric_path)
+    def path_deploymentsapps_metric(namespace, deployment_app, metric):
+        func = metrics.get(metric, None)
+        if func is None:
+            return {"error": "metric not found"}, 404
+
+        return func(namespace, deployment_app, metric)
 
     return app
 
