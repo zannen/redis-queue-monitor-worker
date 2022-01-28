@@ -29,7 +29,9 @@ def queue_func(*args, **kwargs):
     logging.basicConfig(format="[%(asctime)-15s] [%(levelname)s] %(message)s")
     logger = logging.getLogger("queue_func")
     logger.setLevel("INFO")
-    logger.info("Processing queue job with args=%s and kwargs=%s", args, kwargs)
+    logger.info(
+        "Processing queue job with args=%s and kwargs=%s", args, kwargs
+    )
     if "sleep" in kwargs:
         time.sleep(int(kwargs["sleep"]))
     return {
@@ -38,6 +40,30 @@ def queue_func(*args, **kwargs):
             "kwargs": kwargs,
         },
     }
+
+
+def worker_info(worker) -> dict:
+    content = {
+        "queues": [queue.name for queue in worker.queues],
+    }
+    for attr in [
+        "birth_date",
+        # "current_job",
+        "failed_job_count",
+        "hostname",
+        "last_heartbeat",
+        "name",
+        "pid",
+        # "queues",
+        "state",
+        "successful_job_count",
+        "total_working_time",
+    ]:
+        try:
+            content[attr] = getattr(worker, attr)
+        except AttributeError:
+            content[attr] = "<<attr not found>>"
+    return content
 
 
 def base_app(config: dict):
@@ -54,34 +80,44 @@ def base_app(config: dict):
         port=app.redis_port,
     )
 
-    redis_queues = os.environ.get("REDIS_QUEUES", "high,low")
-    app.redis_queue_names = [x.strip() for x in redis_queues.split(",")]
+    # A list of all valid queue names
+    app.redis_queue_names = ["high", "low"]
 
     log_level = os.environ.get("LOGLEVEL", "INFO")
     logging.basicConfig(format="[%(asctime)-15s] [%(levelname)s] %(message)s")
     app.logger.setLevel(log_level)
     app.logger.info(
         "Redis config: host=%s:%s queues=[%s]",
-        app.redis_host, app.redis_port, ",".join(app.redis_queue_names)
+        app.redis_host,
+        app.redis_port,
+        ",".join(app.redis_queue_names),
     )
 
     return app
 
 
-def queue_job_count(
-    redis_conn,
-    queue_name: str,
-    job_statuses: List[str],
-) -> int:
-    queue = rq.Queue(queue_name, connection=redis_conn)
-    count = 0
-    for job_id in queue.job_ids:
-        job = queue.fetch_job(job_id)
-        if job is None:
-            continue
-        if job.get_status(refresh=True) in job_statuses:
-            count += 1
-    return count
+def queue_job_count(queue, job_statuses: List[str]) -> int:
+    """
+    This function counts jobs that in the given state(s) for a given queue.
+    """
+    jobs = [
+        job_id
+        for job_id in queue.job_ids
+        if queue.fetch_job(job_id).get_status(refresh=True) in job_statuses
+    ]
+    return len(jobs)
+
+
+def queue_busy_worker_count(queue: str) -> int:
+    """
+    This function counts the number of busy workers for a given queue.
+    """
+    busy_workers = [
+        worker.name
+        for worker in rq.Worker.all(queue=queue)
+        if worker.state == "busy"
+    ]
+    return len(busy_workers)
 
 
 def create_apiserver_app(config={}):
@@ -136,7 +172,7 @@ def create_apiserver_app(config={}):
         return {"counts": counts}, 200
 
     @app.route("/queues/<queue_name>/enqueue", methods=["POST"])
-    def path_queues_enqueue(queue_name):
+    def path_queue_enqueue(queue_name):
         if queue_name not in app.redis_queue_names:
             return {"error": "queue not found"}, 404
         sync = flask.request.args.get("sync", "false").lower()
@@ -159,7 +195,7 @@ def create_apiserver_app(config={}):
         }, 200
 
     @app.route("/queues/<queue_name>/jobs/<job_id>")
-    def path_job(queue_name, job_id):
+    def path_queue_job(queue_name, job_id):
         if queue_name not in app.redis_queue_names:
             return {"error": "queue not found"}, 404
         queue = rq.Queue(queue_name, connection=app.redis_conn)
@@ -173,6 +209,21 @@ def create_apiserver_app(config={}):
                 "status": job.get_status(),
             },
         }, 200
+
+    @app.route("/queues/<queue_name>/workers")
+    def path_queue_workers(queue_name):
+        if queue_name not in app.redis_queue_names:
+            return {"error": "queue not found"}, 404
+        queue = rq.Queue(queue_name, connection=app.redis_conn)
+        redis_workers = rq.Worker.all(queue=queue)
+        workers = [worker_info(worker) for worker in redis_workers]
+        return {"workers": workers}, 200
+
+    @app.route("/workers")
+    def path_workers():
+        redis_workers = rq.Worker.all(connection=app.redis_conn)
+        workers = [worker_info(worker) for worker in redis_workers]
+        return {"workers": workers}, 200
 
     return app
 
@@ -190,19 +241,31 @@ def create_metrics_exporter_app(config={}):
     )
 
     def redisqueue_length(namespace, deployment_app, metric):
+        """
+        Return a metric that indicates how many redis queue workers there
+        should be. This needs to include 2 components:
+        - the number of queued jobs: more queued jobs, more workers needed
+        - the number of busy workers: don't scale down and kill busy workers
+        """
+        value = 0
+        qnames = "?"
+        qinfo = {}
         # For `metricLabelSelector`, see `matchLabels` in rq-worker-*.yaml.
         mls = flask.request.args.get("metricLabelSelector")
-        qlengths = 0
-        qnames = "?"
         if mls.startswith("queues="):
             qnames = mls[7:]
             for qname in qnames.split("-"):
-                if qname in app.redis_queue_names:
-                    qlengths += queue_job_count(
-                        app.redis_conn,
-                        qname,
-                        ["queued", "started"],
-                    )
+                if qname not in app.redis_queue_names:
+                    qinfo[qname] = {"error": "queue not found"}
+                    continue
+                queue = rq.Queue(qname, connection=app.redis_conn)
+                jobs = queue_job_count(queue, ["queued"])
+                busy_workers = queue_busy_worker_count(queue)
+                qinfo[qname] = {
+                    "queued_jobs": jobs,
+                    "busy_workers": busy_workers,
+                }
+                value += jobs + busy_workers
 
         now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         content = {
@@ -211,6 +274,9 @@ def create_metrics_exporter_app(config={}):
             "metadata": {"selflink": f"{base_path}/"},
             "items": [
                 {
+                    "_debug": {
+                        "queue_info": qinfo,
+                    },
                     "describedObject": {
                         "kind": "Deployment",
                         "namespace": namespace,
@@ -219,7 +285,7 @@ def create_metrics_exporter_app(config={}):
                     },
                     "metricName": "count",
                     "timestamp": now,
-                    "value": str(qlengths),
+                    "value": str(value),
                 },
             ],
         }
@@ -243,8 +309,9 @@ def create_metrics_exporter_app(config={}):
                     "namespaced": True,
                     "kind": "MetricValueList",
                     "verbs": ["get"],
-                } for metric_name in sorted(metrics.keys())
-            ]
+                }
+                for metric_name in sorted(metrics.keys())
+            ],
         }, 200
 
     @app.route(metric_path)
