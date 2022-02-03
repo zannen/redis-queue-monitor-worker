@@ -106,7 +106,7 @@ def create_apiserver_app(config={}):
     log_level = os.environ.get("LOGLEVEL", "INFO")
     logging.basicConfig(format="[%(asctime)-15s] [%(levelname)s] %(message)s")
     app.logger.setLevel(log_level)
-    app.logger.info("Redis config: host=%s:%s", app.redis_host, app.redis_port)
+    app.logger.info("Redis: %s:%s", app.redis_host, app.redis_port)
 
     @app.route("/")
     def path_root():
@@ -203,6 +203,10 @@ def create_metrics_exporter_app(config={}):
     app = flask.Flask(__name__)
     app.config.update(config)
 
+    app.redis_host = os.environ.get("REDIS_HOST", "redis-server").split(".")[0]
+    app.redis_domain = os.environ.get("REDIS_DOMAIN", "svc.cluster.local")
+    app.redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+
     app.redis_connections: Dict[str, redis.StrictRedis] = {}
 
     def get_redis_connection(host: str, port: int) -> redis.StrictRedis:
@@ -219,6 +223,12 @@ def create_metrics_exporter_app(config={}):
     log_level = os.environ.get("LOGLEVEL", "INFO")
     logging.basicConfig(format="[%(asctime)-15s] [%(levelname)s] %(message)s")
     app.logger.setLevel(log_level)
+    app.logger.info(
+        "Redis: %s.<namespace>.%s:%d",
+        app.redis_host,
+        app.redis_domain,
+        app.redis_port,
+    )
 
     base_path = f"/apis/{API}/{API_VER}"
     metric_path = (
@@ -265,8 +275,8 @@ def create_metrics_exporter_app(config={}):
             # custom metrics server in one namespace needs to be able to query
             # the redis server in any other namespace.
             redis_conn = app.get_redis_connection(
-                f"redis-server.{namespace}.svc.cluster.local",
-                6379,
+                f"{app.redis_host}.{namespace}.{app.redis_domain}",
+                app.redis_port,
             )
             all_busy_workers: List[str] = []
             qinfo = {}
@@ -295,7 +305,7 @@ def create_metrics_exporter_app(config={}):
 
         except Exception as exc:
             app.logger.warning("Swallowed an Exception: %s", str(exc))
-            content["items"][0]["_debug"] = {"error": str(exc)}
+            content["error"] = str(exc)
 
         # Always return HTTP 200, even after catching an exception, so that the
         # error can be easily seen with:
@@ -330,11 +340,11 @@ def create_metrics_exporter_app(config={}):
         func = metrics.get(metric, None)
         if func is None:
             content = {
-                "kind": "MetricValueList",
                 "apiVersion": f"{API}/{API_VER}",
-                "metadata": {"selflink": f"{base_path}/"},
-                "items": [],
                 "error": "metric not found",
+                "items": [],
+                "kind": "MetricValueList",
+                "metadata": {"selflink": f"{base_path}/"},
             }
             return content, 200
 
