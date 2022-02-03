@@ -7,7 +7,7 @@ import datetime
 import logging
 import os
 import time
-from typing import List
+from typing import Any, Dict, List
 
 import flask
 import redis
@@ -43,7 +43,7 @@ def queue_func(*args, **kwargs):
 
 
 def worker_info(worker) -> dict:
-    content = {
+    content: Dict[str, Any] = {
         "queues": [queue.name for queue in worker.queues],
     }
     for attr in [
@@ -64,36 +64,6 @@ def worker_info(worker) -> dict:
         except AttributeError:
             content[attr] = "<<attr not found>>"
     return content
-
-
-def base_app(config: dict):
-    """
-    This function creates a base Flask app.
-    """
-    app = flask.Flask(__name__)
-    app.config.update(config)
-
-    app.redis_host = os.environ.get("REDIS_HOST", "redis-server")
-    app.redis_port = int(os.environ.get("REDIS_PORT", "6379"))
-    app.redis_conn = redis.StrictRedis(
-        host=app.redis_host,
-        port=app.redis_port,
-    )
-
-    # A list of all valid queue names
-    app.redis_queue_names = ["high", "low"]
-
-    log_level = os.environ.get("LOGLEVEL", "INFO")
-    logging.basicConfig(format="[%(asctime)-15s] [%(levelname)s] %(message)s")
-    app.logger.setLevel(log_level)
-    app.logger.info(
-        "Redis config: host=%s:%s queues=[%s]",
-        app.redis_host,
-        app.redis_port,
-        ",".join(app.redis_queue_names),
-    )
-
-    return app
 
 
 def queue_job_count(queue, job_statuses: List[str]) -> int:
@@ -124,20 +94,27 @@ def create_apiserver_app(config={}):
     """
     This function is called by gunicorn and creates a Flask app.
     """
-    app = base_app(config)
+    app = flask.Flask(__name__)
+    app.config.update(config)
+
+    app.redis_host = os.environ.get("REDIS_HOST", "redis-server")
+    app.redis_port = int(os.environ.get("REDIS_PORT", "6379"))
+    app.redis_conn = redis.StrictRedis(
+        host=app.redis_host,
+        port=app.redis_port,
+    )
+
+    log_level = os.environ.get("LOGLEVEL", "INFO")
+    logging.basicConfig(format="[%(asctime)-15s] [%(levelname)s] %(message)s")
+    app.logger.setLevel(log_level)
+    app.logger.info("Redis config: host=%s:%s", app.redis_host, app.redis_port)
 
     @app.route("/")
     def path_root():
         return {"status": "OK"}, 200
 
-    @app.route("/queues")
-    def path_queues_list():
-        return {"queues": sorted(app.redis_queue_names)}, 200
-
     @app.route("/queues/<queue_name>/jobs")
     def path_queue_jobs(queue_name):
-        if queue_name not in app.redis_queue_names:
-            return {"error": "queue not found"}, 404
         queue = rq.Queue(queue_name, connection=app.redis_conn)
         jobs = {}
         for job_id in queue.job_ids:
@@ -154,8 +131,6 @@ def create_apiserver_app(config={}):
 
     @app.route("/queues/<queue_name>/length")
     def path_queue_length(queue_name):
-        if queue_name not in app.redis_queue_names:
-            return {"error": "queue not found"}, 404
         queue = rq.Queue(queue_name, connection=app.redis_conn)
         return {"length": len(queue)}, 200
 
@@ -173,8 +148,6 @@ def create_apiserver_app(config={}):
 
     @app.route("/queues/<queue_name>/enqueue", methods=["POST"])
     def path_queue_enqueue(queue_name):
-        if queue_name not in app.redis_queue_names:
-            return {"error": "queue not found"}, 404
         sync = flask.request.args.get("sync", "false").lower()
         is_async = not yaml.safe_load(sync)
         queue = rq.Queue(
@@ -196,8 +169,6 @@ def create_apiserver_app(config={}):
 
     @app.route("/queues/<queue_name>/jobs/<job_id>")
     def path_queue_job(queue_name, job_id):
-        if queue_name not in app.redis_queue_names:
-            return {"error": "queue not found"}, 404
         queue = rq.Queue(queue_name, connection=app.redis_conn)
         job = queue.fetch_job(job_id)
         if job is None:
@@ -212,8 +183,6 @@ def create_apiserver_app(config={}):
 
     @app.route("/queues/<queue_name>/workers")
     def path_queue_workers(queue_name):
-        if queue_name not in app.redis_queue_names:
-            return {"error": "queue not found"}, 404
         queue = rq.Queue(queue_name, connection=app.redis_conn)
         redis_workers = rq.Worker.all(queue=queue)
         workers = [worker_info(worker) for worker in redis_workers]
@@ -232,7 +201,25 @@ def create_metrics_exporter_app(config={}):
     """
     This function is called by gunicorn and creates a Flask app.
     """
-    app = base_app(config)
+    app = flask.Flask(__name__)
+    app.config.update(config)
+
+    app.redis_connections: Dict[str, redis.StrictRedis] = {}
+
+    def get_redis_connection(host: str, port: int) -> redis.StrictRedis:
+        key = f"{host}:{port}"
+        conn = app.redis_connections.get(key, None)
+        if conn is None:
+            conn = redis.StrictRedis(host=host, port=port)
+            app.redis_connections[key] = conn
+
+        return conn
+
+    app.get_redis_connection = get_redis_connection
+
+    log_level = os.environ.get("LOGLEVEL", "INFO")
+    logging.basicConfig(format="[%(asctime)-15s] [%(levelname)s] %(message)s")
+    app.logger.setLevel(log_level)
 
     base_path = f"/apis/{API}/{API_VER}"
     metric_path = (
@@ -250,15 +237,22 @@ def create_metrics_exporter_app(config={}):
         value = 0
         qnames = "?"
         qinfo = {}
+
         # For `metricLabelSelector`, see `matchLabels` in rq-worker-*.yaml.
         mls = flask.request.args.get("metricLabelSelector")
+
+        # Contact the redis server in the given namespace. This is because
+        # Kubernetes objectes of kind APIService are not namespaced, so the
+        # custom metrics server in one namespace needs to be able to query the
+        # redis server in any other namespace.
+        redis_conn = app.get_redis_connection(
+            f"redis-server.{namespace}.svc.cluster.local",
+            6379,
+        )
         if mls.startswith("queues="):
             qnames = mls[7:]
             for qname in qnames.split("-"):
-                if qname not in app.redis_queue_names:
-                    qinfo[qname] = {"error": "queue not found"}
-                    continue
-                queue = rq.Queue(qname, connection=app.redis_conn)
+                queue = rq.Queue(qname, connection=redis_conn)
                 jobs = queue_job_count(queue, ["queued"])
                 busy_workers = queue_busy_worker_count(queue)
                 qinfo[qname] = {
