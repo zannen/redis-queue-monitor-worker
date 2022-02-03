@@ -233,25 +233,45 @@ def create_metrics_exporter_app(config={}):
         - the number of queued jobs: more queued jobs, more workers needed
         - the number of busy workers: don't scale down and kill busy workers
         """
-        value = 0
-        qnames = "?"
-        qinfo = {}
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        content = {
+            "kind": "MetricValueList",
+            "apiVersion": f"{API}/{API_VER}",
+            "metadata": {"selflink": f"{base_path}/"},
+            "items": [
+                {
+                    "describedObject": {
+                        "kind": "Deployment",
+                        "namespace": namespace,
+                        "name": deployment_app,
+                        "apiVersion": "apps/v1",
+                    },
+                    "metricName": "count",
+                    "timestamp": now,
+                    "value": "0",
+                },
+            ],
+        }
 
-        # For `metricLabelSelector`, see `matchLabels` in rq-worker-*.yaml.
-        mls = flask.request.args.get("metricLabelSelector")
+        try:
+            # For `metricLabelSelector`, see `matchLabels` in rq-worker-*.yaml.
+            mls = flask.request.args.get("metricLabelSelector")
 
-        # Contact the redis server in the given namespace. This is because
-        # Kubernetes objectes of kind APIService are not namespaced, so the
-        # custom metrics server in one namespace needs to be able to query the
-        # redis server in any other namespace.
-        redis_conn = app.get_redis_connection(
-            f"redis-server.{namespace}.svc.cluster.local",
-            6379,
-        )
-        if mls.startswith("queues="):
+            if not mls.startswith("queues="):
+                return content, 200
+
+            # Contact the redis server in the given namespace. This is because
+            # Kubernetes objectes of kind APIService are not namespaced, so the
+            # custom metrics server in one namespace needs to be able to query
+            # the redis server in any other namespace.
+            redis_conn = app.get_redis_connection(
+                f"redis-server.{namespace}.svc.cluster.local",
+                6379,
+            )
             all_busy_workers: List[str] = []
-            qnames = mls[7:]
-            for qname in qnames.split("-"):
+            qinfo = {}
+            value = 0
+            for qname in mls[7:].split("-"):
                 queue = rq.Queue(qname, connection=redis_conn)
                 job_count = queue_job_count(queue, ["queued"])
                 busy_workers = queue_busy_workers(queue)
@@ -267,29 +287,19 @@ def create_metrics_exporter_app(config={}):
             all_busy_workers = list(set(all_busy_workers))
             value += len(all_busy_workers)
 
-        now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        content = {
-            "kind": "MetricValueList",
-            "apiVersion": f"{API}/{API_VER}",
-            "metadata": {"selflink": f"{base_path}/"},
-            "items": [
-                {
-                    "_debug": {
-                        "all_busy_workers": all_busy_workers,
-                        "queue_info": qinfo,
-                    },
-                    "describedObject": {
-                        "kind": "Deployment",
-                        "namespace": namespace,
-                        "name": deployment_app,
-                        "apiVersion": "apps/v1",
-                    },
-                    "metricName": "count",
-                    "timestamp": now,
-                    "value": str(value),
-                },
-            ],
-        }
+            content["items"][0]["_debug"] = {
+                "all_busy_workers": all_busy_workers,
+                "queue_info": qinfo,
+            }
+            content["items"][0]["value"] = str(value)
+
+        except Exception as exc:
+            app.logger.warning("Swallowed an Exception: %s", str(exc))
+            content["items"][0]["_debug"] = {"error": str(exc)}
+
+        # Always return HTTP 200, even after catching an exception, so that the
+        # error can be easily seen with:
+        # kubectl get --raw "/apis/custom.metrics.k8s.io/v1beta1/..."
         return content, 200
 
     metrics = {
@@ -319,7 +329,14 @@ def create_metrics_exporter_app(config={}):
     def path_deploymentsapps_metric(namespace, deployment_app, metric):
         func = metrics.get(metric, None)
         if func is None:
-            return {"error": "metric not found"}, 404
+            content = {
+                "kind": "MetricValueList",
+                "apiVersion": f"{API}/{API_VER}",
+                "metadata": {"selflink": f"{base_path}/"},
+                "items": [],
+                "error": "metric not found",
+            }
+            return content, 200
 
         return func(namespace, deployment_app, metric)
 
