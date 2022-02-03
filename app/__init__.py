@@ -78,16 +78,15 @@ def queue_job_count(queue, job_statuses: List[str]) -> int:
     return len(jobs)
 
 
-def queue_busy_worker_count(queue: str) -> int:
+def queue_busy_workers(queue: str) -> List[str]:
     """
     This function counts the number of busy workers for a given queue.
     """
-    busy_workers = [
+    return [
         worker.name
         for worker in rq.Worker.all(queue=queue)
         if worker.state == "busy"
     ]
-    return len(busy_workers)
 
 
 def create_apiserver_app(config={}):
@@ -250,16 +249,23 @@ def create_metrics_exporter_app(config={}):
             6379,
         )
         if mls.startswith("queues="):
+            all_busy_workers: List[str] = []
             qnames = mls[7:]
             for qname in qnames.split("-"):
                 queue = rq.Queue(qname, connection=redis_conn)
-                jobs = queue_job_count(queue, ["queued"])
-                busy_workers = queue_busy_worker_count(queue)
+                job_count = queue_job_count(queue, ["queued"])
+                busy_workers = queue_busy_workers(queue)
                 qinfo[qname] = {
-                    "queued_jobs": jobs,
+                    "queued_job_count": job_count,
                     "busy_workers": busy_workers,
                 }
-                value += jobs + busy_workers
+                value += job_count
+                all_busy_workers += busy_workers
+
+            # Since rq workers may service more than one queue, avoid counting
+            # workers more than once.
+            all_busy_workers = list(set(all_busy_workers))
+            value += len(all_busy_workers)
 
         now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
         content = {
@@ -269,6 +275,7 @@ def create_metrics_exporter_app(config={}):
             "items": [
                 {
                     "_debug": {
+                        "all_busy_workers": all_busy_workers,
                         "queue_info": qinfo,
                     },
                     "describedObject": {
